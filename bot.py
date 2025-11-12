@@ -10,14 +10,13 @@ HTTP Status Checker Bot
 
 import os
 import sys
-import asyncio
 import logging
 from typing import List, Tuple, Dict, Optional
 from urllib.parse import urlparse, urljoin
 from collections import defaultdict
 
 import aiohttp
-from aiohttp import ClientTimeout, web
+from aiohttp import ClientTimeout
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -275,15 +274,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if clean_urls(update.message.text):
         await check_cmd(update, context)
 
-# ============== Запуск через run_webhook ==============
-async def main():
+# ============== ЗАПУСК (без asyncio.run!) ==============
+def main():
+    load_dotenv()
     token = get_token()
     if not token:
-        raise RuntimeError("BOT_TOKEN не задано!")
+        log.error("BOT_TOKEN не задано!")
+        sys.exit(1)
 
     app = ApplicationBuilder().token(token).build()
 
-    # Додаємо хендлери
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check_cmd))
     conv = ConversationHandler(
@@ -294,17 +294,14 @@ async def main():
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # Налаштовуємо webhook
     port = int(os.environ.get("PORT", 10000))
     app_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "telegram-status-bot-zx0t.onrender.com"
     webhook_url = f"https://{app_host}"
 
     log.info(f"Встановлюю webhook: {webhook_url}")
-    await app.bot.set_webhook(url=webhook_url)
 
-    # Запускаємо webhook
-    log.info("Запускаю webhook...")
-    await app.run_webhook(
+    # Запускаємо БЕЗ asyncio.run() — app.run_webhook() сам керує циклом
+    app.run_webhook(
         listen="0.0.0.0",
         port=port,
         url_path=token,
@@ -312,4 +309,4 @@ async def main():
     )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
