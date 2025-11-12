@@ -5,7 +5,7 @@ HTTP Status Checker Bot
 • Додає URL
 • Перевіряє статуси
 • Групує редіректи
-• Працює на Render (Free Tier)
+• Працює на Render через webhook
 """
 
 import os
@@ -275,48 +275,63 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if clean_urls(update.message.text):
         await check_cmd(update, context)
 
-# ============== Бот (головний потік) ==============
-async def run_bot():
-    token = get_token()
-    if not token:
-        raise RuntimeError("BOT_TOKEN не задано!")
-
-    app = ApplicationBuilder().token(token).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("check", check_cmd))
-
-    conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, button)],
-        states={WAIT_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_urls_handler)]},
-        fallbacks=[],
-    )
-    app.add_handler(conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
-    log.info("HTTP Status Checker bot started.")
-    await app.run_polling(drop_pending_updates=True)
-
-# ============== Веб-сервер (у фоні) ==============
-def run_webserver_blocking():
+# ============== Webhook + Health Check ==============
+def run_server():
     async def server():
-        app = web.Application()
-        app.router.add_get("/", lambda r: web.Response(text="Bot is alive!"))
+        token = get_token()
+        if not token:
+            raise RuntimeError("BOT_TOKEN не задано!")
+
+        # Налаштовуємо бота
+        app = ApplicationBuilder().token(token).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("check", check_cmd))
+        conv = ConversationHandler(
+            entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, button)],
+            states={WAIT_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_urls_handler)]},
+            fallbacks=[],
+        )
+        app.add_handler(conv)
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+        # aiohttp сервер
+        web_app = web.Application()
+        web_app.router.add_get("/", lambda r: web.Response(text="Bot is alive!"))
+
+        # Webhook
+        async def webhook_handler(request):
+            try:
+                json_data = await request.json()
+                update = Update.de_json(json_data, app.bot)
+                if update:
+                    await app.process_update(update)
+            except Exception as e:
+                log.error(f"Webhook error: {e}")
+            return web.Response()
+
+        web_app.router.add_post(f"/{token}", webhook_handler)
+
+        # Запускаємо
         port = int(os.environ.get("PORT", 10000))
-        runner = web.AppRunner(app)
+        app_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "telegram-status-bot-zx0t.onrender.com"
+        webhook_url = f"https://{app_host}/{token}"
+
+        log.info(f"Встановлюю webhook: {webhook_url}")
+        try:
+            await app.bot.set_webhook(url=webhook_url)
+        except Exception as e:
+            log.error(f"Не вдалося встановити webhook: {e}")
+
+        runner = web.AppRunner(web_app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        log.info(f"Webserver на {port}")
+        log.info(f"Сервер запущено на порту {port}")
+
         await asyncio.Event().wait()
+
     asyncio.run(server())
 
 # ============== Запуск ==============
-async def main():
-    await asyncio.gather(
-        run_bot(),                    # головний потік — має event loop
-        asyncio.to_thread(run_webserver_blocking)  # фоновий потік
-    )
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_server()
