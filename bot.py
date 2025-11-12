@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HTTP Status Checker Bot v2.0
+HTTP Status Checker Bot v2.1
 • Додає/видаляє URL по одному
 • Автоперевірка кожні 6 годин
 • Кеш + оптимізація
@@ -260,7 +260,7 @@ async def run_auto_check(context: ContextTypes.DEFAULT_TYPE):
 # ============== Обробники ==============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "<b>HTTP Status Checker v2.0</b>\n\n"
+        "<b>HTTP Status Checker v2.1</b>\n\n"
         "• Додавай/видаляй URL\n"
         "• Перевірка за запитом\n"
         "• Автоперевірка кожні 6 годин\n"
@@ -370,10 +370,11 @@ def main():
         log.error("BOT_TOKEN не задано!")
         sys.exit(1)
 
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).job_queue_enabled(True).build()  # ← Увімкнено job_queue
 
     app.add_handler(CommandHandler("start", start))
     
+    # ВИПРАВЛЕНО: per_message=False
     conv = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, button)],
         states={
@@ -381,7 +382,7 @@ def main():
             WAIT_URL_DELETE: [CallbackQueryHandler(delete_callback)]
         },
         fallbacks=[],
-        per_message=True,
+        per_message=False,  # ← Змінено на False
         per_chat=True,
         per_user=False
     )
@@ -393,7 +394,7 @@ def main():
 
     log.info(f"Встановлюю webhook: {webhook_url}")
 
-    # Запускаємо автоперевірку
+    # Автоперевірка через job_queue
     app.job_queue.run_repeating(
         callback=run_auto_check,
         interval=CHECK_INTERVAL,
