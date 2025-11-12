@@ -442,6 +442,31 @@ def main():
     
     log.info("✅ HTTP Status Checker bot started.")
     app.run_polling()
+import asyncio
+from aiohttp import web
+import os
+
+async def handle(request):
+    return web.Response(text="Bot is running on Render!")
+
+async def run_webserver():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+# запуск двох завдань одночасно
+async def main_async():
+    # запускаємо aiohttp web-сервер і бота паралельно
+    task1 = asyncio.create_task(run_webserver())
+    task2 = asyncio.create_task(asyncio.to_thread(main))  # твоя функція main()
+    await asyncio.gather(task1, task2)
+
+if __name__ == "__main__":
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
