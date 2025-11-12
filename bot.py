@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Bot — HTTP Status Checker (Enhanced)
-• Масове додавання URL
-• Групування редіректів по цільових доменах
-• Покращений вигляд виводу
+HTTP Status Checker Bot
+• Додає URL
+• Перевіряє статуси
+• Групує редіректи
+• Працює на Render (Free Tier)
 """
 
 import os
 import sys
 import asyncio
 import logging
-from typing import List, Optional, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from urllib.parse import urlparse, urljoin
 from collections import defaultdict
 
@@ -35,43 +36,35 @@ log = logging.getLogger("status-bot")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 URLS_FILE = os.path.join(BASE_DIR, "urls.txt")
 
-CONNECT_SEC = 3
-READ_SEC = 5
-TOTAL_SEC = 8
-TIMEOUT = ClientTimeout(total=TOTAL_SEC, connect=CONNECT_SEC, sock_connect=CONNECT_SEC, sock_read=READ_SEC)
+TIMEOUT = ClientTimeout(total=8, connect=3)
 MAX_CONCURRENCY = 20
 TG_LIMIT = 3500
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Upgrade-Insecure-Requests": "1",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "*/*",
     "Connection": "keep-alive",
-    "Accept-Encoding": "identity",
 }
 
 # ============== UI ==============
 MENU = [["Додати URL", "Запустити перевірку"], ["Список URL", "Очистити список"]]
 KB = ReplyKeyboardMarkup(MENU, resize_keyboard=True)
-
-WAIT_URL = "WAIT_URL"
+WAIT_URL = 1
 
 # ============== Утіліти ==============
-def _get_token(argv: List[str]) -> str:
-    if "--token" in argv:
-        i = argv.index("--token")
-        if i + 1 < len(argv):
-            return argv[i + 1].strip()
-    return (os.getenv("BOT_TOKEN") or "").strip()
+def get_token() -> str:
+    if "--token" in sys.argv:
+        idx = sys.argv.index("--token")
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1].strip()
+    return os.getenv("BOT_TOKEN", "").strip()
 
 def chunk_text(text: str, limit: int = TG_LIMIT) -> List[str]:
-    if len(text) <= limit:
+    if not text or len(text) <= limit:
         return [text] if text else []
+    lines = text.split("\n")
     parts, cur, size = [], [], 0
-    for line in text.split("\n"):
+    for line in lines:
         ln = len(line) + 1
         if cur and size + ln > limit:
             parts.append("\n".join(cur))
@@ -82,316 +75,248 @@ def chunk_text(text: str, limit: int = TG_LIMIT) -> List[str]:
         parts.append("\n".join(cur))
     return parts
 
-def normalize_to_url(s: str) -> Tuple[str, str]:
-    s = (s or "").strip()
+def normalize_url(s: str) -> Tuple[str, str]:
+    s = s.strip()
     if s.startswith(("http://", "https://")):
         return s, s
     return s, f"https://{s}"
 
-def clean_lines(text: str) -> List[str]:
-    raw = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    out = []
-    for ln in raw:
-        if " " in ln:
-            continue
-        if ln.startswith(("http://", "https://")) or "." in ln:
-            out.append(ln)
+def clean_urls(text: str) -> List[str]:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and " " not in ln]
+    urls = [ln for ln in lines if ln.startswith(("http://", "https://")) or "." in ln]
     seen = set()
     uniq = []
-    for x in out:
-        key = x[:-1] if x.endswith("/") else x
+    for url in urls:
+        key = url[:-1] if url.endswith("/") else url
         if key not in seen:
             seen.add(key)
-            uniq.append(x)
+            uniq.append(url)
     return uniq
 
-def load_urls_from_file() -> List[str]:
+def load_urls() -> List[str]:
     if not os.path.exists(URLS_FILE):
         return []
     with open(URLS_FILE, "r", encoding="utf-8") as f:
-        return clean_lines(f.read())
+        return clean_urls(f.read())
 
-def append_urls_to_file(urls: List[str]) -> Tuple[List[str], List[str]]:
+def save_urls(new_urls: List[str]) -> Tuple[List[str], List[str]]:
     os.makedirs(BASE_DIR, exist_ok=True)
-    have = set((x[:-1] if x.endswith("/") else x) for x in load_urls_from_file())
+    existing = {(u[:-1] if u.endswith("/") else u) for u in load_urls()}
     added, skipped = [], []
-    for u in urls:
-        _, url = normalize_to_url(u)
+    for raw in new_urls:
+        _, url = normalize_url(raw)
         key = url[:-1] if url.endswith("/") else url
-        if key in have:
-            skipped.append(u)
+        if key in existing:
+            skipped.append(raw)
         else:
             added.append(url)
-            have.add(key)
+            existing.add(key)
     if added:
         with open(URLS_FILE, "a", encoding="utf-8") as f:
             for url in added:
                 f.write(url + "\n")
     return added, skipped
 
-def clear_urls_file():
+def clear_urls():
     if os.path.exists(URLS_FILE):
         os.remove(URLS_FILE)
 
-def _host(u: str) -> str:
+def get_host(url: str) -> str:
     try:
-        h = (urlparse(u).hostname or "").lower()
-        return h[4:] if h.startswith("www.") else h
-    except Exception:
+        h = urlparse(url).hostname or ""
+        return h.lower().removeprefix("www.")
+    except:
         return ""
 
-def _same_host(a: str, b: str) -> bool:
-    return _host(a) == _host(b) and bool(_host(a))
-
-def _same_pathish(a: str, b: str) -> bool:
-    pa = urlparse(a).path or "/"
-    pb = urlparse(b).path or "/"
-    return pa.rstrip("/") == pb.rstrip("/")
+def same_host(a: str, b: str) -> bool:
+    return get_host(a) == get_host(b) and get_host(a) != ""
 
 # ============== HTTP ==============
-async def fetch_status(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[int], Optional[str]]:
+async def fetch(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[int], Optional[str]]:
     try:
-        async with session.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False) as r:
-            status = r.status
-            loc = r.headers.get("Location")
+        async with session.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False) as resp:
+            loc = resp.headers.get("Location")
             if loc:
-                loc = urljoin(str(r.url), loc)
-            return status, loc
-    except (asyncio.TimeoutError, aiohttp.ClientError, Exception):
+                loc = urljoin(str(resp.url), loc)
+            return resp.status, loc
+    except:
         return None, None
 
-async def check_one(session: aiohttp.ClientSession, line: str) -> Tuple[str, str, Optional[int], Optional[str]]:
-    disp, start_url = normalize_to_url(line)
-    st, loc = await fetch_status(session, start_url)
-    return disp, start_url, st, loc
-
-async def check_many(lines: List[str]) -> List[Tuple[str, str, Optional[int], Optional[str]]]:
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY, limit_per_host=MAX_CONCURRENCY)
-    async with aiohttp.ClientSession(timeout=TIMEOUT, connector=connector) as session:
+async def check_urls(urls: List[str]) -> List[Tuple[str, str, Optional[int], Optional[str]]]:
+    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY)
+    async with aiohttp.ClientSession(connector=connector, timeout=TIMEOUT) as session:
         sem = asyncio.Semaphore(MAX_CONCURRENCY)
-        async def _task(x: str):
+        async def task(raw):
             async with sem:
-                return await check_one(session, x)
-        return await asyncio.gather(*[_task(x) for x in lines])
+                disp, url = normalize_url(raw)
+                status, location = await fetch(session, url)
+                return disp, url, status, location
+        return await asyncio.gather(*[task(u) for u in urls])
 
-# ============== Рендер ==============
-def render_three(pairs: List[Tuple[str, str, Optional[int], Optional[str]]]) -> Tuple[str, str, str]:
-    problems, oks200 = [], []
-    redirects_by_domain: Dict[str, List[str]] = defaultdict(list)
-    
-    for disp_url, start_url, st, loc in pairs:
-        if st is None:
-            problems.append(f"{disp_url} — ERR")
-            continue
-        
-        if 200 <= st < 300:
-            if st == 200 or (_same_host(start_url, loc) if loc else False):
-                oks200.append(f"{disp_url}")
-            else:
-                problems.append(f"{disp_url} — {st}")
-            continue
-        
-        if 300 <= st < 400 and loc:
-            if _same_host(start_url, loc):
-                oks200.append(f"{disp_url}")
-            else:
-                target_host = _host(loc)
-                redirects_by_domain[target_host or "unknown"].append(f"{disp_url} — {st} → {loc}")
-            continue
-        
-        if 400 <= st < 600:
-            problems.append(f"{disp_url} — {st}")
-            continue
-        
-        problems.append(f"{disp_url} — {st}")
-    
-    problems_text = "ПРОБЛЕМИ:\n\n" + "\n".join(problems) if problems else ""
-    oks200_text = f"УСПІШНО ({len(oks200)}):\n\n" + "\n".join(oks200) if oks200 else ""
-    
-    redirects_parts = ["РЕДІРЕКТИ (згруповані по цільових доменах):\n"]
-    if redirects_by_domain:
-        for domain, items in sorted(redirects_by_domain.items(), key=lambda x: len(x[1]), reverse=True):
-            redirects_parts.append(f"\n{domain} ({len(items)}):")
-            for item in items:
-                redirects_parts.append(f"  {item}")
-    redirects_text = "\n".join(redirects_parts) if len(redirects_parts) > 1 else ""
-    
-    return problems_text, oks200_text, redirects_text
+# ============== Форматування ==============
+def format_results(results: List[Tuple[str, str, Optional[int], Optional[str]]]) -> Tuple[str, str, str]:
+    problems, success, redirects = [], [], defaultdict(list)
 
-# ============== Handlers ==============
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    welcome_msg = (
-        "<b>HTTP Status Checker Bot</b>\n\n"
-        "Можливості:\n"
-        "• Масове додавання URL\n"
-        "• Перевірка статусів\n"
-        "• Групування редіректів\n\n"
-        "Використовуй кнопки нижче."
+    for disp, url, status, loc in results:
+        if status is None:
+            problems.append(f"{disp} — ERR")
+            continue
+        if 200 <= status < 300:
+            if status == 200 or (loc and same_host(url, loc)):
+                success.append(f"{disp}")
+            else:
+                problems.append(f"{disp} — {status}")
+            continue
+        if 300 <= status < 400 and loc:
+            if same_host(url, loc):
+                success.append(f"{disp}")
+            else:
+                target = get_host(loc) or "unknown"
+                redirects[target].append(f"{disp} — {status} → {loc}")
+            continue
+        problems.append(f"{disp} — {status}")
+
+    p_text = "ПРОБЛЕМИ:\n\n" + "\n".join(problems) if problems else ""
+    s_text = f"УСПІШНО ({len(success)}):\n\n" + "\n".join(success) if success else ""
+    r_parts = ["РЕДІРЕКТИ:\n"]
+    if redirects:
+        for domain, items in sorted(redirects.items(), key=lambda x: len(x[1]), reverse=True):
+            r_parts.append(f"\n{domain} ({len(items)}):")
+            r_parts.extend(f"  {it}" for it in items)
+    r_text = "\n".join(r_parts) if len(r_parts) > 1 else ""
+
+    return p_text, s_text, r_text
+
+# ============== Обробники ==============
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "<b>HTTP Status Checker</b>\n\n"
+        "• Додавай URL\n"
+        "• Перевіряй статуси\n"
+        "• Групуй редіректи\n\n"
+        "Керуй кнопками."
     )
-    await update.message.reply_text(welcome_msg, reply_markup=KB, parse_mode="HTML")
+    await update.message.reply_text(msg, reply_markup=KB, parse_mode="HTML")
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
     cid = update.effective_chat.id
-    
-    if txt == "Додати URL":
-        await update.message.reply_text(
-            "Надішли URL.\n\n"
-            "• Один або кілька (з нового рядка)\n"
-            "• Домени без http:// — додам https://\n\n"
-            "Приклад:\n"
-            "example.com\n"
-            "https://test.com"
-        )
+
+    if text == "Додати URL":
+        await update.message.reply_text("Надішли URL (по одному на рядок).")
         return WAIT_URL
-    
-    if txt == "Запустити перевірку":
-        await run_check_and_reply(context, [cid])
+    if text == "Запустити перевірку":
+        await run_check(context, [cid])
         return ConversationHandler.END
-    
-    if txt == "Список URL":
-        urls = load_urls_from_file()
+    if text == "Список URL":
+        urls = load_urls()
         if urls:
-            body = f"<b>Список URL ({len(urls)}):</b>\n\n"
-            body += "\n".join(f"{i+1}. <code>{u}</code>" for i, u in enumerate(urls))
-            for ch in chunk_text(body) or ["—"]:
-                await update.message.reply_text(ch, parse_mode="HTML")
+            body = f"<b>Список ({len(urls)}):</b>\n\n" + "\n".join(f"{i+1}. <code>{u}</code>" for i, u in enumerate(urls))
+            for part in chunk_text(body):
+                await update.message.reply_text(part, parse_mode="HTML")
         else:
             await update.message.reply_text("Список порожній.")
         return ConversationHandler.END
-    
-    if txt == "Очистити список":
-        clear_urls_file()
-        await update.message.reply_text("Список очищено.", reply_markup=KB)
+    if text == "Очистити список":
+        clear_urls()
+        await update.message.reply_text("Очищено.", reply_markup=KB)
         return ConversationHandler.END
-    
     return ConversationHandler.END
 
-async def save_url_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text:
-        await update.message.reply_text("Порожньо.", reply_markup=KB)
+async def save_urls_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    urls = clean_urls(update.message.text)
+    if not urls:
+        await update.message.reply_text("Немає URL.", reply_markup=KB)
         return ConversationHandler.END
-    
-    candidates = clean_lines(text)
-    if not candidates:
-        await update.message.reply_text("Не знайдено URL.", reply_markup=KB)
-        return ConversationHandler.END
-    
-    added, skipped = append_urls_to_file(candidates)
-    response = []
+    added, skipped = save_urls(urls)
+    msg = []
     if added:
-        response.append(f"<b>Додано {len(added)}:</b>")
-        for url in added[:10]:
-            response.append(f"  • <code>{url}</code>")
+        msg.append(f"<b>Додано {len(added)}:</b>")
+        for u in added[:10]:
+            msg.append(f"  • <code>{u}</code>")
         if len(added) > 10:
-            response.append(f"  ... та ще {len(added)-10}")
+            msg.append(f"  ...ще {len(added)-10}")
     if skipped:
-        response.append(f"\nПропущено: {len(skipped)}")
-    
-    await update.message.reply_text("\n".join(response), reply_markup=KB, parse_mode="HTML")
+        msg.append(f"\nПропущено: {len(skipped)}")
+    await update.message.reply_text("\n".join(msg), reply_markup=KB, parse_mode="HTML")
     return ConversationHandler.END
 
-async def run_check_and_reply(context: ContextTypes.DEFAULT_TYPE, chat_ids: List[int]):
-    urls = load_urls_from_file()
+async def run_check(context: ContextTypes.DEFAULT_TYPE, chat_ids: List[int]):
+    urls = load_urls()
     if not urls:
         for cid in chat_ids:
             await context.bot.send_message(cid, "Список порожній.", reply_markup=KB)
         return
-    
     for cid in chat_ids:
-        await context.bot.send_message(cid, f"Перевіряю {len(urls)} URL...")
-    
-    pairs = await check_many(urls)
-    msg1, msg2, msg3 = render_three(pairs)
-    
+        await context.bot.send_message(cid, f"Перевіряю {len(urls)}...")
+    results = await check_urls(urls)
+    p, s, r = format_results(results)
     for cid in chat_ids:
-        for section in (msg1 or "—", msg2 or "—", msg3 or "—"):
-            for ch in chunk_text(section) or ["—"]:
-                await context.bot.send_message(cid, ch)
+        for section in (p or "—", s or "—", r or "—"):
+            for part in chunk_text(section):
+                await context.bot.send_message(cid, part)
         await context.bot.send_message(cid, "Готово!", reply_markup=KB)
 
-async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    payload = " ".join(context.args).strip() or update.message.text.replace("/check", "", 1).strip()
-    candidates = clean_lines(payload) if payload else load_urls_from_file()
-    
-    if not candidates:
+async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args).strip() or update.message.text.replace("/check", "", 1).strip()
+    urls = clean_urls(text) if text else load_urls()
+    if not urls:
         await update.message.reply_text("Немає URL.")
         return
-    
-    await update.message.reply_text(f"Перевіряю {len(candidates)}...")
-    pairs = await check_many(candidates)
-    msg1, msg2, msg3 = render_three(pairs)
-    
-    for sec in (msg1 or "—", msg2 or "—", msg3 or "—"):
-        for ch in chunk_text(sec) or ["—"]:
-            await update.message.reply_text(ch)
+    await update.message.reply_text(f"Перевіряю {len(urls)}...")
+    results = await check_urls(urls)
+    p, s, r = format_results(results)
+    for sec in (p or "—", s or "—", r or "—"):
+        for part in chunk_text(sec):
+            await update.message.reply_text(part)
     await update.message.reply_text("Готово!", reply_markup=KB)
 
-async def text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    candidates = clean_lines(update.message.text)
-    if not candidates:
-        return
-    await cmd_check(update, context)
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if clean_urls(update.message.text):
+        await check_cmd(update, context)
 
-# ============== Webserver для Render ==============
-async def health_check(request):
-    return web.Response(text="Bot is alive!")
-
-async def run_webserver():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    port = int(os.environ.get("PORT", 10000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info(f"Webserver запущено на порту {port}")
-
-# ============== Запуск бота (блокує) ==============
-def run_bot_blocking():
-    load_dotenv()
-    token = _get_token(sys.argv)
+# ============== Бот (головний потік) ==============
+async def run_bot():
+    token = get_token()
     if not token:
         raise RuntimeError("BOT_TOKEN не задано!")
-    
+
     app = ApplicationBuilder().token(token).build()
-    
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("check", cmd_check))
-    
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("check", check_cmd))
+
     conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, button_handler)],
-        states={WAIT_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_url_state)]},
+        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, button)],
+        states={WAIT_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_urls_handler)]},
         fallbacks=[],
     )
     app.add_handler(conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_fallback))
-    
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
     log.info("HTTP Status Checker bot started.")
-    app.run_polling(drop_pending_updates=True)
+    await app.run_polling(drop_pending_updates=True)
 
-# ============== Webserver ==============
-async def health_check(request):
-    return web.Response(text="Bot is alive!")
+# ============== Веб-сервер (у фоні) ==============
+def run_webserver_blocking():
+    async def server():
+        app = web.Application()
+        app.router.add_get("/", lambda r: web.Response(text="Bot is alive!"))
+        port = int(os.environ.get("PORT", 10000))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        log.info(f"Webserver на {port}")
+        await asyncio.Event().wait()
+    asyncio.run(server())
 
-async def run_webserver():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    port = int(os.environ.get("PORT", 10000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info(f"Webserver запущено на порту {port}")
-    await asyncio.Event().wait()
-
-# ============== Основний запуск ==============
-async def main_async():
+# ============== Запуск ==============
+async def main():
     await asyncio.gather(
-        run_webserver(),
-        asyncio.to_thread(run_bot_blocking)
+        run_bot(),                    # головний потік — має event loop
+        asyncio.to_thread(run_webserver_blocking)  # фоновий потік
     )
 
 if __name__ == "__main__":
-    asyncio.run(main_async())
+    asyncio.run(main())
