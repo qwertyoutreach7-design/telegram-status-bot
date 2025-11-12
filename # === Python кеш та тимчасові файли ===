@@ -1,0 +1,35 @@
+# === Python кеш та тимчасові файли ===
+__pycache__/
+*.py[cod]
+*$py.class
+
+# === Середовища розробки ===
+venv/
+env/
+ENV/
+.venv/
+.Python
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# === IDE / редактори ===
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# === ОС-специфічні файли ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Конфігураційні / приватні файли ===
+.env
+.env.*
+*.log
+
+# === Railway / тимчасові каталоги ===
+node_modules/
+.cache/
