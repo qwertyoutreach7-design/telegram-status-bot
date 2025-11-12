@@ -10,6 +10,7 @@ HTTP Status Checker Bot
 
 import os
 import sys
+import asyncio  # ← ДОДАНО!
 import logging
 from typing import List, Tuple, Dict, Optional
 from urllib.parse import urlparse, urljoin
@@ -144,7 +145,7 @@ async def fetch(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[int]
 async def check_urls(urls: List[str]) -> List[Tuple[str, str, Optional[int], Optional[str]]]:
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY)
     async with aiohttp.ClientSession(connector=connector, timeout=TIMEOUT) as session:
-        sem = asyncio.Semaphore(MAX_CONCURRENCY)
+        sem = asyncio.Semaphore(MAX_CONCURRENCY)  # ← Тепер працює!
         async def task(raw):
             async with sem:
                 disp, url = normalize_url(raw)
@@ -182,7 +183,7 @@ def format_results(results: List[Tuple[str, str, Optional[int], Optional[str]]])
         for domain, items in sorted(redirects.items(), key=lambda x: len(x[1]), reverse=True):
             r_parts.append(f"\n{domain} ({len(items)}):")
             r_parts.extend(f"  {it}" for it in items)
-    r_text = "\n".join(r_parts) if len(r_parts) > 1 else ""
+    r_text = = "\n".join(r_parts) if len(r_parts) > 1 else ""
 
     return p_text, s_text, r_text
 
