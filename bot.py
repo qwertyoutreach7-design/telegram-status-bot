@@ -183,7 +183,7 @@ def format_results(results: List[Tuple[str, str, Optional[int], Optional[str]]])
         for domain, items in sorted(redirects.items(), key=lambda x: len(x[1]), reverse=True):
             r_parts.append(f"\n{domain} ({len(items)}):")
             r_parts.extend(f"  {it}" for it in items)
-    r_text = = "\n".join(r_parts) if len(r_parts) > 1 else ""
+    r_text = "\n".join(r_parts) if len(r_parts) > 1 else ""
 
     return p_text, s_text, r_text
 
