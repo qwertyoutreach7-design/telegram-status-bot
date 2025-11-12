@@ -274,7 +274,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
 
     if text == "Додати URL":
-        await update.message.reply_text("Надішли URL (по одному).")
+        await update.message.reply_text("Надішли URL (по одному в рядок).")
         return WAIT_URL_ADD
     if text == "Запустити перевірку":
         await run_check(context, [cid])
