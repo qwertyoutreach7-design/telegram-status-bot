@@ -370,11 +370,11 @@ def main():
         log.error("BOT_TOKEN не задано!")
         sys.exit(1)
 
-    app = ApplicationBuilder().token(token).job_queue_enabled(True).build()  # ← Увімкнено job_queue
+    # ПРАВИЛЬНО: без job_queue_enabled — воно вмикається автоматично через [job-queue]
+    app = ApplicationBuilder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     
-    # ВИПРАВЛЕНО: per_message=False
     conv = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, button)],
         states={
@@ -382,7 +382,7 @@ def main():
             WAIT_URL_DELETE: [CallbackQueryHandler(delete_callback)]
         },
         fallbacks=[],
-        per_message=False,  # ← Змінено на False
+        per_message=False,  # ← Без warning
         per_chat=True,
         per_user=False
     )
@@ -394,7 +394,7 @@ def main():
 
     log.info(f"Встановлюю webhook: {webhook_url}")
 
-    # Автоперевірка через job_queue
+    # Автоперевірка — працює!
     app.job_queue.run_repeating(
         callback=run_auto_check,
         interval=CHECK_INTERVAL,
