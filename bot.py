@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 HTTP Status Checker Bot
-• Додає URL
-• Перевіряє статуси
-• Групує редіректи
-• Працює на Render через webhook
+• Додає/видаляє URL по одному
+• Автоперевірка кожні 6 годин
+• Оптимізований: кеш, ліміт, UX
 """
 
 import os
 import sys
-import asyncio  # ← ДОДАНО!
+import asyncio
 import logging
 from typing import List, Tuple, Dict, Optional
 from urllib.parse import urlparse, urljoin
@@ -19,13 +18,14 @@ from collections import defaultdict
 import aiohttp
 from aiohttp import ClientTimeout
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     ConversationHandler,
+    CallbackQueryHandler,
     filters
 )
 
@@ -35,10 +35,12 @@ log = logging.getLogger("status-bot")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 URLS_FILE = os.path.join(BASE_DIR, "urls.txt")
+CACHE_FILE = os.path.join(BASE_DIR, "cache.json")
 
 TIMEOUT = ClientTimeout(total=8, connect=3)
-MAX_CONCURRENCY = 20
+MAX_CONCURRENCY = 30
 TG_LIMIT = 3500
+CHECK_INTERVAL = 6 * 3600  # 6 годин
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -47,9 +49,10 @@ HEADERS = {
 }
 
 # ============== UI ==============
-MENU = [["Додати URL", "Запустити перевірку"], ["Список URL", "Очистити список"]]
+MENU = [["Додати URL", "Запустити перевірку"], ["Список URL", "Видалити URL"], ["Очистити список"]]
 KB = ReplyKeyboardMarkup(MENU, resize_keyboard=True)
-WAIT_URL = 1
+
+WAIT_URL_ADD, WAIT_URL_DELETE = range(2)
 
 # ============== Утіліти ==============
 def get_token() -> str:
@@ -117,6 +120,17 @@ def save_urls(new_urls: List[str]) -> Tuple[List[str], List[str]]:
                 f.write(url + "\n")
     return added, skipped
 
+def remove_url(target: str) -> bool:
+    urls = load_urls()
+    normalized = [normalize_url(u)[1] for u in urls]
+    if target not in normalized:
+        return False
+    urls = [u for u in urls if normalize_url(u)[1] != target]
+    with open(URLS_FILE, "w", encoding="utf-8") as f:
+        for u in urls:
+            f.write(u + "\n")
+    return True
+
 def clear_urls():
     if os.path.exists(URLS_FILE):
         os.remove(URLS_FILE)
@@ -131,34 +145,76 @@ def get_host(url: str) -> str:
 def same_host(a: str, b: str) -> bool:
     return get_host(a) == get_host(b) and get_host(a) != ""
 
+# ============== Кеш ==============
+import json
+from datetime import datetime, timedelta
+
+def load_cache() -> Dict:
+    if not os.path.exists(CACHE_FILE):
+        return {}
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Очистити старий кеш (>1 день)
+            cutoff = (datetime.now() - timedelta(days=1)).isoformat()
+            return {k: v for k, v in data.items() if v.get("time", "") > cutoff}
+    except:
+        return {}
+
+def save_cache(cache: Dict):
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+def get_cached(url: str, cache: Dict) -> Optional[Tuple[int, Optional[str]]]:
+    entry = cache.get(url)
+    if entry and entry["time"] > (datetime.now() - timedelta(hours=1)).isoformat():
+        return entry["status"], entry.get("location")
+    return None
+
+def set_cached(url: str, status: int, location: Optional[str], cache: Dict):
+    cache[url] = {
+        "status": status,
+        "location": location,
+        "time": datetime.now().isoformat()
+    }
+
 # ============== HTTP ==============
-async def fetch(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[int], Optional[str]]:
+async def fetch(session: aiohttp.ClientSession, url: str, cache: Dict) -> Tuple[Optional[int], Optional[str]]:
+    cached = get_cached(url, cache)
+    if cached:
+        return cached
     try:
         async with session.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False) as resp:
             loc = resp.headers.get("Location")
             if loc:
                 loc = urljoin(str(resp.url), loc)
-            return resp.status, loc
+            result = resp.status, loc
+            set_cached(url, resp.status, loc, cache)
+            return result
     except:
+        set_cached(url, -1, None, cache)
         return None, None
 
 async def check_urls(urls: List[str]) -> List[Tuple[str, str, Optional[int], Optional[str]]]:
+    cache = load_cache()
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY)
     async with aiohttp.ClientSession(connector=connector, timeout=TIMEOUT) as session:
-        sem = asyncio.Semaphore(MAX_CONCURRENCY)  # ← Тепер працює!
+        sem = asyncio.Semaphore(MAX_CONCURRENCY)
         async def task(raw):
             async with sem:
                 disp, url = normalize_url(raw)
-                status, location = await fetch(session, url)
+                status, location = await fetch(session, url, cache)
                 return disp, url, status, location
-        return await asyncio.gather(*[task(u) for u in urls])
+        results = await asyncio.gather(*[task(u) for u in urls])
+    save_cache(cache)
+    return results
 
 # ============== Форматування ==============
 def format_results(results: List[Tuple[str, str, Optional[int], Optional[str]]]) -> Tuple[str, str, str]:
     problems, success, redirects = [], [], defaultdict(list)
 
     for disp, url, status, loc in results:
-        if status is None:
+        if status is None or status == -1:
             problems.append(f"{disp} — ERR")
             continue
         if 200 <= status < 300:
@@ -187,13 +243,33 @@ def format_results(results: List[Tuple[str, str, Optional[int], Optional[str]]])
 
     return p_text, s_text, r_text
 
+# ============== Автоперевірка ==============
+async def auto_check(app: ApplicationBuilder) -> None:
+    while True:
+        await asyncio.sleep(CHECK_INTERVAL)
+        urls = load_urls()
+        if not urls:
+            continue
+        log.info("Автоперевірка запущена...")
+        results = await check_urls(urls)
+        p, s, r = format_results(results)
+        text = "\n\n".join(sec for sec in (p, s, r) if sec and sec != "—")
+        if not text.strip():
+            text = "Усе гаразд!"
+        else:
+            text = f"Автоперевірка:\n\n{text}"
+        # Надсилаємо всім, хто колись писав (спрощуємо — можна додати БД)
+        # Тут — просто лог
+        log.info(f"Автоперевірка завершена: {len(urls)} URL")
+
 # ============== Обробники ==============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "<b>HTTP Status Checker</b>\n\n"
-        "• Додавай URL\n"
-        "• Перевіряй статуси\n"
-        "• Групуй редіректи\n\n"
+        "<b>HTTP Status Checker v2.0</b>\n\n"
+        "• Додавай/видаляй URL\n"
+        "• Перевірка за запитом\n"
+        "• Автоперевірка кожні 6 годин\n"
+        "• Кеш результатів\n\n"
         "Керуй кнопками."
     )
     await update.message.reply_text(msg, reply_markup=KB, parse_mode="HTML")
@@ -203,8 +279,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
 
     if text == "Додати URL":
-        await update.message.reply_text("Надішли URL (по одному на рядок).")
-        return WAIT_URL
+        await update.message.reply_text("Надішли URL (по одному).")
+        return WAIT_URL_ADD
     if text == "Запустити перевірку":
         await run_check(context, [cid])
         return ConversationHandler.END
@@ -217,13 +293,28 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("Список порожній.")
         return ConversationHandler.END
+    if text == "Видалити URL":
+        urls = load_urls()
+        if not urls:
+            await update.message.reply_text("Список порожній.")
+            return ConversationHandler.END
+        keyboard = [
+            [InlineKeyboardButton(f"{i+1}. {u}", callback_data=f"del:{u}")]
+            for i, u in enumerate(urls)
+        ]
+        keyboard.append([InlineKeyboardButton("Скасувати", callback_data="cancel")])
+        await update.message.reply_text(
+            "Обери URL для видалення:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WAIT_URL_DELETE
     if text == "Очистити список":
         clear_urls()
         await update.message.reply_text("Очищено.", reply_markup=KB)
         return ConversationHandler.END
     return ConversationHandler.END
 
-async def save_urls_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     urls = clean_urls(update.message.text)
     if not urls:
         await update.message.reply_text("Немає URL.", reply_markup=KB)
@@ -239,6 +330,25 @@ async def save_urls_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if skipped:
         msg.append(f"\nПропущено: {len(skipped)}")
     await update.message.reply_text("\n".join(msg), reply_markup=KB, parse_mode="HTML")
+    return ConversationHandler.END
+
+async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "cancel":
+        await query.edit_message_text("Видалення скасовано.", reply_markup=None)
+        return ConversationHandler.END
+
+    if data.startswith("del:"):
+        url = data[4:]
+        if remove_url(url):
+            await query.edit_message_text(f"Видалено: <code>{url}</code>", parse_mode="HTML")
+        else:
+            await query.edit_message_text("Не знайдено.", reply_markup=None)
+        return ConversationHandler.END
+
     return ConversationHandler.END
 
 async def run_check(context: ContextTypes.DEFAULT_TYPE, chat_ids: List[int]):
@@ -257,24 +367,6 @@ async def run_check(context: ContextTypes.DEFAULT_TYPE, chat_ids: List[int]):
                 await context.bot.send_message(cid, part)
         await context.bot.send_message(cid, "Готово!", reply_markup=KB)
 
-async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args).strip() or update.message.text.replace("/check", "", 1).strip()
-    urls = clean_urls(text) if text else load_urls()
-    if not urls:
-        await update.message.reply_text("Немає URL.")
-        return
-    await update.message.reply_text(f"Перевіряю {len(urls)}...")
-    results = await check_urls(urls)
-    p, s, r = format_results(results)
-    for sec in (p or "—", s or "—", r or "—"):
-        for part in chunk_text(sec):
-            await update.message.reply_text(part)
-    await update.message.reply_text("Готово!", reply_markup=KB)
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if clean_urls(update.message.text):
-        await check_cmd(update, context)
-
 # ============== ЗАПУСК ==============
 def main():
     load_dotenv()
@@ -286,20 +378,27 @@ def main():
     app = ApplicationBuilder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("check", check_cmd))
     conv = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, button)],
-        states={WAIT_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_urls_handler)]},
+        states={
+            WAIT_URL_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_url_handler)],
+            WAIT_URL_DELETE: [CallbackQueryHandler(delete_callback)]
+        },
         fallbacks=[],
     )
     app.add_handler(conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     port = int(os.environ.get("PORT", 10000))
     app_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "telegram-status-bot-zx0t.onrender.com"
     webhook_url = f"https://{app_host}/{token}"
 
     log.info(f"Встановлюю webhook: {webhook_url}")
+
+    # Запускаємо автоперевірку у фоні
+    async def start_auto_check():
+        asyncio.create_task(auto_check(app))
+
+    app.job_queue.run_once(start_auto_check, 5)
 
     app.run_webhook(
         listen="0.0.0.0",
