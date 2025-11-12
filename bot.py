@@ -16,7 +16,7 @@ from urllib.parse import urlparse, urljoin
 from collections import defaultdict
 
 import aiohttp
-from aiohttp import ClientTimeout
+from aiohttp import ClientTimeout, web  # ← ТУТ ВИПРАВЛЕНО!
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -296,15 +296,14 @@ def main():
 
     port = int(os.environ.get("PORT", 10000))
     app_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "telegram-status-bot-zx0t.onrender.com"
-    webhook_url = f"https://{app_host}/{token}"  # ← ДОДАЄМО /ТОКЕН!
+    webhook_url = f"https://{app_host}/{token}"
 
     log.info(f"Встановлюю webhook: {webhook_url}")
 
-    # Додаємо простий маршрут для health check
+    # Health check
     async def health_check(request):
         return web.Response(text="Bot is alive!")
 
-    # Налаштовуємо aiohttp вручну
     web_app = web.Application()
     web_app.router.add_get("/", health_check)
 
@@ -313,7 +312,7 @@ def main():
         port=port,
         url_path=token,
         webhook_url=webhook_url,
-        web_app=web_app  # ← передаємо наш web_app
+        web_app=web_app
     )
 
 if __name__ == "__main__":
