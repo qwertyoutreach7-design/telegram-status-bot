@@ -274,7 +274,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if clean_urls(update.message.text):
         await check_cmd(update, context)
 
-# ============== ЗАПУСК (без asyncio.run!) ==============
+# ============== ЗАПУСК ==============
 def main():
     load_dotenv()
     token = get_token()
@@ -296,16 +296,24 @@ def main():
 
     port = int(os.environ.get("PORT", 10000))
     app_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "telegram-status-bot-zx0t.onrender.com"
-    webhook_url = f"https://{app_host}"
+    webhook_url = f"https://{app_host}/{token}"  # ← ДОДАЄМО /ТОКЕН!
 
     log.info(f"Встановлюю webhook: {webhook_url}")
 
-    # Запускаємо БЕЗ asyncio.run() — app.run_webhook() сам керує циклом
+    # Додаємо простий маршрут для health check
+    async def health_check(request):
+        return web.Response(text="Bot is alive!")
+
+    # Налаштовуємо aiohttp вручну
+    web_app = web.Application()
+    web_app.router.add_get("/", health_check)
+
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
         url_path=token,
-        webhook_url=webhook_url
+        webhook_url=webhook_url,
+        web_app=web_app  # ← передаємо наш web_app
     )
 
 if __name__ == "__main__":
