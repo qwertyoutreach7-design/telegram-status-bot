@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HTTP Status Checker Bot
+HTTP Status Checker Bot v2.0
 • Додає/видаляє URL по одному
 • Автоперевірка кожні 6 годин
-• Оптимізований: кеш, ліміт, UX
+• Кеш + оптимізація
+• Render Free Tier
 """
 
 import os
 import sys
 import asyncio
 import logging
+import json
 from typing import List, Tuple, Dict, Optional
 from urllib.parse import urlparse, urljoin
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 import aiohttp
 from aiohttp import ClientTimeout
@@ -146,16 +149,12 @@ def same_host(a: str, b: str) -> bool:
     return get_host(a) == get_host(b) and get_host(a) != ""
 
 # ============== Кеш ==============
-import json
-from datetime import datetime, timedelta
-
 def load_cache() -> Dict:
     if not os.path.exists(CACHE_FILE):
         return {}
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Очистити старий кеш (>1 день)
             cutoff = (datetime.now() - timedelta(days=1)).isoformat()
             return {k: v for k, v in data.items() if v.get("time", "") > cutoff}
     except:
@@ -244,23 +243,19 @@ def format_results(results: List[Tuple[str, str, Optional[int], Optional[str]]])
     return p_text, s_text, r_text
 
 # ============== Автоперевірка ==============
-async def auto_check(app: ApplicationBuilder) -> None:
-    while True:
-        await asyncio.sleep(CHECK_INTERVAL)
-        urls = load_urls()
-        if not urls:
-            continue
-        log.info("Автоперевірка запущена...")
-        results = await check_urls(urls)
-        p, s, r = format_results(results)
-        text = "\n\n".join(sec for sec in (p, s, r) if sec and sec != "—")
-        if not text.strip():
-            text = "Усе гаразд!"
-        else:
-            text = f"Автоперевірка:\n\n{text}"
-        # Надсилаємо всім, хто колись писав (спрощуємо — можна додати БД)
-        # Тут — просто лог
-        log.info(f"Автоперевірка завершена: {len(urls)} URL")
+async def run_auto_check(context: ContextTypes.DEFAULT_TYPE):
+    urls = load_urls()
+    if not urls:
+        return
+    log.info(f"Автоперевірка: {len(urls)} URL...")
+    results = await check_urls(urls)
+    p, s, r = format_results(results)
+    text = "\n\n".join(sec for sec in (p, s, r) if sec and sec != "—")
+    if not text.strip():
+        text = "Усе гаразд!"
+    else:
+        text = f"<b>Автоперевірка</b>\n\n{text}"
+    log.info(f"Автоперевірка завершена: {len(urls)} URL")
 
 # ============== Обробники ==============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,6 +373,7 @@ def main():
     app = ApplicationBuilder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
+    
     conv = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, button)],
         states={
@@ -385,6 +381,9 @@ def main():
             WAIT_URL_DELETE: [CallbackQueryHandler(delete_callback)]
         },
         fallbacks=[],
+        per_message=True,
+        per_chat=True,
+        per_user=False
     )
     app.add_handler(conv)
 
@@ -394,11 +393,12 @@ def main():
 
     log.info(f"Встановлюю webhook: {webhook_url}")
 
-    # Запускаємо автоперевірку у фоні
-    async def start_auto_check():
-        asyncio.create_task(auto_check(app))
-
-    app.job_queue.run_once(start_auto_check, 5)
+    # Запускаємо автоперевірку
+    app.job_queue.run_repeating(
+        callback=run_auto_check,
+        interval=CHECK_INTERVAL,
+        first=10
+    )
 
     app.run_webhook(
         listen="0.0.0.0",
