@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HTTP Status Checker Bot v3.1
-• Зберігання URL у GitHub (urls.txt)
+HTTP Status Checker Bot v3.2
+• GitHub storage з діагностикою
 • Додавання/видалення → push
 • Автоперевірка кожні 6 годин
 • Кеш + UTF-8 fallback
 • Render Free Tier
 """
-
 import os
 import sys
 import asyncio
 import logging
 import json
 import base64
+import re
 from typing import List, Tuple, Dict, Optional
 from urllib.parse import urlparse, urljoin
 from collections import defaultdict
 from datetime import datetime, timedelta
-
 import aiohttp
 from aiohttp import ClientTimeout
 from dotenv import load_dotenv
@@ -33,37 +32,29 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters
 )
-
 # ============== Налаштування ==============
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("status-bot")
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(BASE_DIR, "cache.json")
-
 TIMEOUT = ClientTimeout(total=8, connect=3)
 MAX_CONCURRENCY = 30
 TG_LIMIT = 3500
-CHECK_INTERVAL = 6 * 3600  # 6 годин
-
+CHECK_INTERVAL = 6 * 3600 # 6 годин
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "*/*",
     "Connection": "keep-alive",
 }
-
 # GitHub
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")  # username/repo
+GITHUB_REPO = os.getenv("GITHUB_REPO") # username/repo
 GITHUB_API = "https://api.github.com"
 GITHUB_FILE_PATH = "urls.txt"
-
 # ============== UI ==============
 MENU = [["Додати URL", "Запустити перевірку"], ["Список URL", "Видалити URL"], ["Очистити список"]]
 KB = ReplyKeyboardMarkup(MENU, resize_keyboard=True)
-
 WAIT_URL_ADD, WAIT_URL_DELETE = range(2)
-
 # ============== GitHub Утіліти ==============
 async def github_request(session: aiohttp.ClientSession, method: str, url: str, json_data: dict = None):
     headers = {
@@ -72,19 +63,26 @@ async def github_request(session: aiohttp.ClientSession, method: str, url: str, 
     }
     async with session.request(method, url, headers=headers, json=json_data) as resp:
         return await resp.json(), resp.status
-
 async def get_urls_from_github() -> List[str]:
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        log.warning("GitHub не налаштовано — список порожній")
+    if not GITHUB_TOKEN:
+        log.error("GITHUB_TOKEN не задано в Environment!")
         return []
+    if not GITHUB_REPO:
+        log.error("GITHUB_REPO не задано в Environment!")
+        return []
+    log.info(f"Завантаження URL з GitHub: {GITHUB_REPO}/{GITHUB_FILE_PATH}")
     url = f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
     async with aiohttp.ClientSession() as session:
         data, status = await github_request(session, "GET", url)
-        if status != 200 or "content" not in data:
-            log.info(f"Файл {GITHUB_FILE_PATH} не знайдено або помилка: {status}")
+        if status == 404:
+            log.warning(f"Файл {GITHUB_FILE_PATH} не знайдено — створюємо порожній")
             return []
-        
-        # ВИПРАВЛЕНО: UTF-8 з BOM, CP1251, latin-1 fallback
+        if status != 200:
+            log.error(f"GitHub GET помилка: {status}, {data}")
+            return []
+        if "content" not in data:
+            log.error(f"Немає 'content' у відповіді: {data}")
+            return []
         raw_bytes = base64.b64decode(data["content"])
         try:
             content = raw_bytes.decode("utf-8-sig")
@@ -93,11 +91,14 @@ async def get_urls_from_github() -> List[str]:
                 content = raw_bytes.decode("cp1251")
             except UnicodeDecodeError:
                 content = raw_bytes.decode("latin-1", errors="replace")
-        return clean_urls(content)
-
+        urls = clean_urls(content)
+        log.info(f"Завантажено {len(urls)} URL з GitHub")
+        return urls
 async def update_github_file(content: str, sha: str = None):
     if not GITHUB_TOKEN or not GITHUB_REPO:
+        log.error("GitHub не налаштовано — не можу зберегти!")
         return
+    log.info(f"Оновлюю {GITHUB_FILE_PATH} у GitHub (sha: {sha})")
     url = f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
     data = {
         "message": "update urls.txt",
@@ -107,8 +108,11 @@ async def update_github_file(content: str, sha: str = None):
     if sha:
         data["sha"] = sha
     async with aiohttp.ClientSession() as session:
-        await github_request(session, "PUT", url, data)
-
+        resp_data, status = await github_request(session, "PUT", url, data)
+        if status in (200, 201):
+            log.info("Файл успішно оновлено в GitHub")
+        else:
+            log.error(f"GitHub PUT помилка: {status}, {resp_data}")
 async def get_file_sha() -> Optional[str]:
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return None
@@ -116,7 +120,6 @@ async def get_file_sha() -> Optional[str]:
     async with aiohttp.ClientSession() as session:
         data, status = await github_request(session, "GET", url)
         return data.get("sha") if status == 200 else None
-
 # ============== Утіліти ==============
 def get_token() -> str:
     if "--token" in sys.argv:
@@ -124,7 +127,6 @@ def get_token() -> str:
         if idx + 1 < len(sys.argv):
             return sys.argv[idx + 1].strip()
     return os.getenv("BOT_TOKEN", "").strip()
-
 def chunk_text(text: str, limit: int = TG_LIMIT) -> List[str]:
     if not text or len(text) <= limit:
         return [text] if text else []
@@ -140,16 +142,15 @@ def chunk_text(text: str, limit: int = TG_LIMIT) -> List[str]:
     if cur:
         parts.append("\n".join(cur))
     return parts
-
 def normalize_url(s: str) -> Tuple[str, str]:
     s = s.strip()
     if s.startswith(("http://", "https://")):
         return s, s
     return s, f"https://{s}"
-
 def clean_urls(text: str) -> List[str]:
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and " " not in ln]
-    urls = [ln for ln in lines if ln.startswith(("http://", "https://")) or "." in ln]
+    # Витягуємо потенційні URL за допомогою regex, щоб підтримувати масове додавання
+    candidates = re.findall(r'(https?://\S+|\S+\.\S+)', text)
+    urls = [cand.strip() for cand in candidates if cand.strip()]
     seen = set()
     uniq = []
     for url in urls:
@@ -158,10 +159,8 @@ def clean_urls(text: str) -> List[str]:
             seen.add(key)
             uniq.append(url)
     return uniq
-
 async def load_urls() -> List[str]:
     return await get_urls_from_github()
-
 async def add_urls(urls: List[str]) -> Tuple[List[str], List[str]]:
     current = await load_urls()
     existing = {(u[:-1] if u.endswith("/") else u) for u in current}
@@ -175,14 +174,14 @@ async def add_urls(urls: List[str]) -> Tuple[List[str], List[str]]:
             added.append(url)
             existing.add(key)
     if added:
+        log.info(f"Додаю {len(added)} URL у GitHub...")
         await save_urls_to_github(current + added)
+        log.info("URL успішно збережено в GitHub")
     return added, skipped
-
 async def save_urls_to_github(urls: List[str]):
     content = "\n".join(urls)
     sha = await get_file_sha()
     await update_github_file(content, sha)
-
 async def remove_url(target: str) -> bool:
     current = await load_urls()
     normalized = [normalize_url(u)[1] for u in current]
@@ -191,22 +190,20 @@ async def remove_url(target: str) -> bool:
     new_urls = [u for u in current if normalize_url(u)[1] != target]
     await save_urls_to_github(new_urls)
     return True
-
 async def clear_urls():
     sha = await get_file_sha()
     if sha:
         await update_github_file("", sha)
-
+    else:
+        log.warning("SHA не знайдено — файл може не існувати")
 def get_host(url: str) -> str:
     try:
         h = urlparse(url).hostname or ""
         return h.lower().removeprefix("www.")
     except:
         return ""
-
 def same_host(a: str, b: str) -> bool:
     return get_host(a) == get_host(b) and get_host(a) != ""
-
 # ============== Кеш ==============
 def load_cache() -> Dict:
     if not os.path.exists(CACHE_FILE):
@@ -216,26 +213,26 @@ def load_cache() -> Dict:
             data = json.load(f)
             cutoff = (datetime.now() - timedelta(days=1)).isoformat()
             return {k: v for k, v in data.items() if v.get("time", "") > cutoff}
-    except:
+    except Exception as e:
+        log.error(f"Помилка читання кешу: {e}")
         return {}
-
 def save_cache(cache: Dict):
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
-
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.error(f"Помилка запису кешу: {e}")
 def get_cached(url: str, cache: Dict) -> Optional[Tuple[int, Optional[str]]]:
     entry = cache.get(url)
     if entry and entry["time"] > (datetime.now() - timedelta(hours=1)).isoformat():
         return entry["status"], entry.get("location")
     return None
-
 def set_cached(url: str, status: int, location: Optional[str], cache: Dict):
     cache[url] = {
         "status": status,
         "location": location,
         "time": datetime.now().isoformat()
     }
-
 # ============== HTTP ==============
 async def fetch(session: aiohttp.ClientSession, url: str, cache: Dict) -> Tuple[Optional[int], Optional[str]]:
     cached = get_cached(url, cache)
@@ -249,10 +246,10 @@ async def fetch(session: aiohttp.ClientSession, url: str, cache: Dict) -> Tuple[
             result = resp.status, loc
             set_cached(url, resp.status, loc, cache)
             return result
-    except:
+    except Exception as e:
+        log.warning(f"Помилка запиту {url}: {e}")
         set_cached(url, -1, None, cache)
         return None, None
-
 async def check_urls(urls: List[str]) -> List[Tuple[str, str, Optional[int], Optional[str]]]:
     cache = load_cache()
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY)
@@ -266,11 +263,9 @@ async def check_urls(urls: List[str]) -> List[Tuple[str, str, Optional[int], Opt
         results = await asyncio.gather(*[task(u) for u in urls])
     save_cache(cache)
     return results
-
 # ============== Форматування ==============
 def format_results(results: List[Tuple[str, str, Optional[int], Optional[str]]]) -> Tuple[str, str, str]:
     problems, success, redirects = [], [], defaultdict(list)
-
     for disp, url, status, loc in results:
         if status is None or status == -1:
             problems.append(f"{disp} — ERR")
@@ -289,18 +284,15 @@ def format_results(results: List[Tuple[str, str, Optional[int], Optional[str]]])
                 redirects[target].append(f"{disp} — {status} → {loc}")
             continue
         problems.append(f"{disp} — {status}")
-
     p_text = "ПРОБЛЕМИ:\n\n" + "\n".join(problems) if problems else ""
     s_text = f"УСПІШНО ({len(success)}):\n\n" + "\n".join(success) if success else ""
     r_parts = ["РЕДІРЕКТИ:\n"]
     if redirects:
         for domain, items in sorted(redirects.items(), key=lambda x: len(x[1]), reverse=True):
             r_parts.append(f"\n{domain} ({len(items)}):")
-            r_parts.extend(f"  {it}" for it in items)
+            r_parts.extend(f" {it}" for it in items)
     r_text = "\n".join(r_parts) if len(r_parts) > 1 else ""
-
     return p_text, s_text, r_text
-
 # ============== Автоперевірка ==============
 async def run_auto_check(context: ContextTypes.DEFAULT_TYPE):
     urls = await load_urls()
@@ -315,11 +307,10 @@ async def run_auto_check(context: ContextTypes.DEFAULT_TYPE):
     else:
         text = f"<b>Автоперевірка</b>\n\n{text}"
     log.info(f"Автоперевірка завершена: {len(urls)} URL")
-
 # ============== Обробники ==============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "<b>HTTP Status Checker v3.1</b>\n\n"
+        "<b>HTTP Status Checker v3.2</b>\n\n"
         "• Додавай/видаляй URL (зберігається в GitHub)\n"
         "• Перевірка за запитом\n"
         "• Автоперевірка кожні 6 годин\n"
@@ -327,13 +318,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Керуй кнопками."
     )
     await update.message.reply_text(msg, reply_markup=KB, parse_mode="HTML")
-
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     cid = update.effective_chat.id
-
     if text == "Додати URL":
-        await update.message.reply_text("Надішли URL")
+        await update.message.reply_text("Надішли URL(и) для додавання. Можна декілька, розділені пробілами, комами або новими рядками.")
         return WAIT_URL_ADD
     if text == "Запустити перевірку":
         await run_check(context, [cid])
@@ -367,7 +356,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Очищено.", reply_markup=KB)
         return ConversationHandler.END
     return ConversationHandler.END
-
 async def add_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     urls = clean_urls(update.message.text)
     if not urls:
@@ -378,23 +366,20 @@ async def add_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if added:
         msg.append(f"<b>Додано {len(added)}:</b>")
         for u in added[:10]:
-            msg.append(f"  • <code>{u}</code>")
+            msg.append(f" • <code>{u}</code>")
         if len(added) > 10:
-            msg.append(f"  ...ще {len(added)-10}")
+            msg.append(f" ...ще {len(added)-10}")
     if skipped:
         msg.append(f"\nПропущено: {len(skipped)}")
     await update.message.reply_text("\n".join(msg), reply_markup=KB, parse_mode="HTML")
     return ConversationHandler.END
-
 async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-
     if data == "cancel":
         await query.edit_message_text("Видалення скасовано.", reply_markup=None)
         return ConversationHandler.END
-
     if data.startswith("del:"):
         url = data[4:]
         if await remove_url(url):
@@ -402,9 +387,7 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("Не знайдено.", reply_markup=None)
         return ConversationHandler.END
-
     return ConversationHandler.END
-
 async def run_check(context: ContextTypes.DEFAULT_TYPE, chat_ids: List[int]):
     urls = await load_urls()
     if not urls:
@@ -420,7 +403,6 @@ async def run_check(context: ContextTypes.DEFAULT_TYPE, chat_ids: List[int]):
             for part in chunk_text(section):
                 await context.bot.send_message(cid, part)
         await context.bot.send_message(cid, "Готово!", reply_markup=KB)
-
 # ============== ЗАПУСК ==============
 def main():
     load_dotenv()
@@ -428,11 +410,12 @@ def main():
     if not token:
         log.error("BOT_TOKEN не задано!")
         sys.exit(1)
-
+    # Діагностика при старті
+    log.info(f"GITHUB_TOKEN: {'є' if GITHUB_TOKEN else 'немає'}")
+    log.info(f"GITHUB_REPO: {GITHUB_REPO or 'немає'}")
     app = ApplicationBuilder().token(token).build()
-
     app.add_handler(CommandHandler("start", start))
-    
+   
     conv = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, button)],
         states={
@@ -445,25 +428,20 @@ def main():
         per_user=False
     )
     app.add_handler(conv)
-
     port = int(os.environ.get("PORT", 10000))
     app_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "telegram-status-bot-zx0t.onrender.com"
     webhook_url = f"https://{app_host}/{token}"
-
     log.info(f"Встановлюю webhook: {webhook_url}")
-
     app.job_queue.run_repeating(
         callback=run_auto_check,
         interval=CHECK_INTERVAL,
         first=10
     )
-
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
         url_path=token,
         webhook_url=webhook_url
     )
-
 if __name__ == "__main__":
     main()
